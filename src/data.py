@@ -32,8 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
+
+# Tolerate slightly truncated images rather than erroring on the last few bytes.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -58,6 +61,7 @@ def build_dataframe(verbose: bool = False) -> pd.DataFrame:
     skipped_no_folder = 0
     skipped_no_image = 0
     skipped_bad_hb = 0
+    skipped_unreadable = 0  # per-image: corrupt/truncated/not-really-a-PNG files
     seen_patients = 0
 
     for country in config.COUNTRIES:
@@ -93,6 +97,22 @@ def build_dataframe(verbose: bool = False) -> pd.DataFrame:
                 skipped_no_image += 1
                 continue
 
+            # Verify each crop actually opens; drop corrupt/truncated files so a
+            # bad image can't crash training later.
+            readable = []
+            for img in images:
+                if _is_readable(img):
+                    readable.append(img)
+                else:
+                    skipped_unreadable += 1
+                    if verbose:
+                        print(f"[data] unreadable image skipped: {img}")
+            if not readable:
+                # Every crop for this patient was unreadable -> no usable images.
+                skipped_no_image += 1
+                continue
+            images = readable
+
             gender = _clean_gender(r["gender"])
             age = _to_float(r["age"])
             patient_id = f"{country}/{number}"
@@ -115,7 +135,8 @@ def build_dataframe(verbose: bool = False) -> pd.DataFrame:
     print(
         f"[data] Patients seen: {seen_patients}  kept: {kept}  skipped: {skipped} "
         f"(no/invalid folder: {skipped_no_folder}, no _palpebral.png: "
-        f"{skipped_no_image}, unusable Hgb: {skipped_bad_hb})"
+        f"{skipped_no_image}, unusable Hgb: {skipped_bad_hb})  "
+        f"unreadable images dropped: {skipped_unreadable}"
     )
 
     df = pd.DataFrame(rows)
@@ -171,6 +192,20 @@ def _palpebral_images(folder: Path) -> list:
             continue
         out.append(p)
     return out
+
+
+def _is_readable(path: Path) -> bool:
+    """True if PIL can open and verify the image (catches corrupt/truncated files).
+
+    verify() consumes the file object, so it must be called on a fresh handle and
+    the image re-opened before any real use — which __getitem__ does separately.
+    """
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001 - any decode error means "skip this file"
+        return False
 
 
 def _clean_number(value):
@@ -318,13 +353,25 @@ class ConjunctivaDataset(Dataset):
         self.indices = list(indices)
         self.task = task
         self.transform = _build_transforms(train)
+        self._warned = set()  # image paths we've already logged as bad
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, i):
         row = self.df.loc[self.indices[i]]
-        image = Image.open(row["image_path"]).convert("RGB")
+        try:
+            image = Image.open(row["image_path"]).convert("RGB")
+        except Exception:  # noqa: BLE001 - a single bad file must not kill a run
+            path = row["image_path"]
+            if path not in self._warned:
+                print(f"[data] WARNING: failed to load {path}; "
+                      f"falling back to a valid sample.")
+                self._warned.add(path)
+            # Fall back to a known-good sample so the batch stays intact.
+            if i != 0:
+                return self[0]
+            raise  # index 0 itself is unreadable — nothing safe to fall back to
         image = self.transform(image)
         if self.task == "classification":
             target = torch.tensor(float(row["anemic"]), dtype=torch.float32)
