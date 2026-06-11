@@ -9,6 +9,7 @@ openpyxl>=3.1          # read the India.xlsx / Italy.xlsx spreadsheets
 pillow>=9.0
 scikit-learn>=1.2      # metrics: AUC, confusion matrix
 tqdm>=4.64             # progress bars
+gradio>=4.0            # src/demo.py sanity-check UI
 
 # Optional — only needed if you pass --wandb. Safe to leave installed; the code
 # runs fine without a W&B account when the flag is off.
