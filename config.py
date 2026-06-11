@@ -175,6 +175,20 @@ TIGHT_CROP_MARGIN = 0.05          # ~5% padding around the detected eyelid bbox
 TIGHT_CROP_BLACK_THRESHOLD = 20   # grayscale brightness > this counts as eyelid
 TIGHT_CROP_MIN_FG_PIXELS = 64     # fewer foreground px -> treat as all-black, fall back
 
+# Some images (notably parts of India) are RAW close-up photos with full skin /
+# background and NO black border — the non-black trick treats the whole frame as
+# foreground and crops almost nothing. We detect those and crop by conjunctiva
+# COLOR instead so all sources end up framed the same way.
+#
+# Image-type detection: an image with very little black is a RAW photo.
+RAW_PHOTO_BLACK_FRAC = 0.10       # black-pixel fraction below this => RAW photo
+# Conjunctiva color heuristic (HSV, 0-255 channels): reddish hue + saturated.
+CONJ_HUE_RED_HI = 20              # hue <= this is "red"...
+CONJ_HUE_RED_LO_WRAP = 235        # ...or >= this (hue wraps around at red)
+CONJ_MIN_SAT = 80                 # min saturation to be conjunctiva (excludes pale skin)
+CONJ_MIN_VAL = 40                 # min brightness (ignore dark noise)
+CONJ_MIN_FRAC = 0.01              # raw mask must cover >= this fraction, else center-crop fallback
+
 # ---------------------------------------------------------------------------
 # 5. Training
 # ---------------------------------------------------------------------------

@@ -453,23 +453,81 @@ def _rows_for(df: pd.DataFrame, patient_ids) -> list:
 # ---------------------------------------------------------------------------
 # 3b. Tight-crop preprocessing — equalize framing across sources
 # ---------------------------------------------------------------------------
-def foreground_fraction(img, thresh: int = None) -> float:
-    """Fraction of non-black (eyelid) pixels: grayscale brightness > thresh."""
+# Two image types exist:
+#   * CLEAN CUTOUT — eyelid on a BLACK background. The non-black region IS the
+#     eyelid, so we bbox the non-black pixels.
+#   * RAW PHOTO    — a close-up with full skin/background and NO black border.
+#     The non-black trick fails (everything is "foreground"), so we find the
+#     conjunctiva by COLOR (reddish + saturated in HSV) and bbox that instead.
+# We detect the type from the black-pixel fraction, then crop accordingly so the
+# eyelid fills the frame the same way for every source.
+def _gray(img) -> np.ndarray:
+    return np.asarray(img.convert("L"))
+
+
+def detect_image_type(img, thresh: int = None) -> str:
+    """'raw' if there is almost no black border, else 'cutout'."""
     thresh = config.TIGHT_CROP_BLACK_THRESHOLD if thresh is None else thresh
-    gray = np.asarray(img.convert("L"))
-    return float((gray > thresh).mean())
+    black_frac = float((_gray(img) <= thresh).mean())
+    return "raw" if black_frac < config.RAW_PHOTO_BLACK_FRAC else "cutout"
+
+
+def _conjunctiva_mask(img) -> np.ndarray:
+    """Reddish, saturated pixels (the conjunctiva) — for raw photos with no black."""
+    hsv = np.asarray(img.convert("HSV"))
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    reddish = (h <= config.CONJ_HUE_RED_HI) | (h >= config.CONJ_HUE_RED_LO_WRAP)
+    return reddish & (s >= config.CONJ_MIN_SAT) & (v >= config.CONJ_MIN_VAL)
+
+
+def eyelid_mask(img, thresh: int = None):
+    """Return (mask, image_type). Cutouts use the non-black mask; raw photos use
+    the conjunctiva-color mask. `foreground_fraction` and the crop both use this,
+    so the 'eyelid fraction' is measured the right way for each image type."""
+    thresh = config.TIGHT_CROP_BLACK_THRESHOLD if thresh is None else thresh
+    rgb = img.convert("RGB")
+    image_type = detect_image_type(rgb, thresh)
+    if image_type == "cutout":
+        return (_gray(rgb) > thresh), "cutout"
+    return _conjunctiva_mask(rgb), "raw"
+
+
+def foreground_fraction(img) -> float:
+    """Eyelid fraction, measured per image type (non-black for cutouts,
+    conjunctiva-color for raw photos)."""
+    mask, _ = eyelid_mask(img)
+    return float(mask.mean())
+
+
+def _center_square(rgb, size: int):
+    """Largest centered square, resized — the low-confidence fallback crop."""
+    W, H = rgb.size
+    side = min(W, H)
+    left, top = (W - side) // 2, (H - side) // 2
+    return rgb.crop((left, top, left + side, top + side)).resize((size, size))
+
+
+def _bbox_crop(rgb, mask, margin: float, size: int):
+    H, W = mask.shape
+    ys, xs = np.where(mask)
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    mx = int(round((x1 - x0 + 1) * margin))
+    my = int(round((y1 - y0 + 1) * margin))
+    x0 = max(0, x0 - mx); y0 = max(0, y0 - my)
+    x1 = min(W - 1, x1 + mx); y1 = min(H - 1, y1 + my)
+    return rgb.crop((x0, y0, x1 + 1, y1 + 1)).resize((size, size))
 
 
 def tight_crop_image(img, size: int = None, margin: float = None,
                      thresh: int = None, min_fg: int = None):
-    """Crop to the non-black foreground bbox (+margin) and resize to a square.
+    """Type-aware tight crop to the eyelid, resized to a square.
 
-    Detects the eyelid as pixels brighter than `thresh`, takes that region's
-    bounding box, pads it by `margin` (fraction of bbox size), crops, and resizes
-    to `size`x`size`. So the eyelid fills the frame the same way for every source.
+    CUTOUT -> bbox of non-black pixels. RAW -> bbox of conjunctiva-color pixels.
+    If the mask is too small to trust (all-black cutout, or no confident
+    conjunctiva in a raw photo), fall back to a center crop.
 
-    Returns (cropped_resized_RGB_image, used_fallback). Falls back to a plain
-    resize of the original when the image is all-black or the mask is tiny.
+    Returns (cropped_resized_RGB_image, info) where
+        info = {"type": "cutout"|"raw", "fallback": bool}.
     """
     size = config.IMAGE_SIZE if size is None else size
     margin = config.TIGHT_CROP_MARGIN if margin is None else margin
@@ -477,21 +535,19 @@ def tight_crop_image(img, size: int = None, margin: float = None,
     min_fg = config.TIGHT_CROP_MIN_FG_PIXELS if min_fg is None else min_fg
 
     rgb = img.convert("RGB")
-    gray = np.asarray(rgb.convert("L"))
-    mask = gray > thresh
-    if int(mask.sum()) < min_fg:
-        # All-black or a speck of noise — nothing reliable to crop to.
-        return rgb.resize((size, size)), True
+    mask, image_type = eyelid_mask(rgb, thresh)
+    H, W = mask.shape
+    fg = int(mask.sum())
 
-    H, W = gray.shape
-    ys, xs = np.where(mask)
-    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
-    mx = int(round((x1 - x0 + 1) * margin))
-    my = int(round((y1 - y0 + 1) * margin))
-    x0 = max(0, x0 - mx); y0 = max(0, y0 - my)
-    x1 = min(W - 1, x1 + mx); y1 = min(H - 1, y1 + my)
-    crop = rgb.crop((x0, y0, x1 + 1, y1 + 1))
-    return crop.resize((size, size)), False
+    if image_type == "raw":
+        min_needed = max(min_fg, int(config.CONJ_MIN_FRAC * H * W))
+    else:
+        min_needed = min_fg
+
+    if fg < min_needed:
+        # Low confidence — center-crop and flag it.
+        return _center_square(rgb, size), {"type": image_type, "fallback": True}
+    return _bbox_crop(rgb, mask, margin, size), {"type": image_type, "fallback": False}
 
 
 class TightCrop:
@@ -519,41 +575,49 @@ def _sample_paths(sub: pd.DataFrame, cap):
 
 def foreground_report(df: pd.DataFrame, sample_per_source: int = 250,
                       verbose: bool = True) -> dict:
-    """Median foreground fraction (eyelid px / total) per source, BEFORE vs AFTER
-    the tight crop — confirms framing differed and is now equalized. Also counts
-    fallbacks (all-black / tiny-mask images). Samples up to `sample_per_source`
-    images per source so it stays fast on the real data."""
+    """Median eyelid (foreground) fraction per source, BEFORE vs AFTER the crop —
+    after the type-aware crop all three sources should land at a SIMILAR value.
+    Also counts how many images were cutout vs raw vs fallback per source (so you
+    can see how many India images are the raw type). Samples up to
+    `sample_per_source` images per source to stay fast on the real data."""
     if verbose:
-        print("\n[crop] Foreground fraction (eyelid px / total) — median per source:")
-        print(f"  {'source':6} {'n':>5} {'before':>8} {'after':>8}  fallbacks")
+        print("\n[crop] Eyelid (foreground) fraction — median per source, "
+              "before vs after, with type counts:")
+        print(f"  {'source':6} {'n':>5} {'before':>8} {'after':>8}   "
+              f"{'cutout':>6} {'raw':>5} {'fallback':>8}")
     out = {}
     for src in SOURCE_ORDER:
         sub = df[df["source"] == src]
         if sub.empty:
             continue
-        before, after, fallbacks = [], [], 0
+        before, after = [], []
+        counts = {"cutout": 0, "raw": 0, "fallback": 0}
         for p in _sample_paths(sub, sample_per_source):
             try:
                 img = Image.open(p).convert("RGB")
             except Exception:  # noqa: BLE001
                 continue
             before.append(foreground_fraction(img))
-            cropped, used_fb = tight_crop_image(img)
+            cropped, info = tight_crop_image(img)
             after.append(foreground_fraction(cropped))
-            fallbacks += int(used_fb)
+            if info["fallback"]:
+                counts["fallback"] += 1
+            else:
+                counts[info["type"]] += 1
         if not before:
             continue
         mb, ma = float(np.median(before)), float(np.median(after))
         out[src] = {"before_median": mb, "after_median": ma,
-                    "fallbacks": fallbacks, "n": len(before)}
+                    "n": len(before), **counts}
         if verbose:
-            print(f"  {src:6} {len(before):>5} {mb:>8.3f} {ma:>8.3f}  {fallbacks}")
+            print(f"  {src:6} {len(before):>5} {mb:>8.3f} {ma:>8.3f}   "
+                  f"{counts['cutout']:>6} {counts['raw']:>5} {counts['fallback']:>8}")
     return out
 
 
 def save_crop_preview(df: pd.DataFrame, path=None, per_source: int = 4):
-    """Save a (sources x per_source) grid of CROPPED images so all three sources
-    can be eyeballed side by side. Default: results/crop_preview.png."""
+    """Save a (sources x per_source) grid of CROPPED images, each tile labelled
+    with its detected type (cutout / raw / fallback). Default: results/crop_preview.png."""
     from PIL import ImageDraw
 
     path = Path(path) if path else (config.RESULTS_DIR / "crop_preview.png")
@@ -567,10 +631,15 @@ def save_crop_preview(df: pd.DataFrame, path=None, per_source: int = 4):
                  ["image_path"].tolist()[:per_source])
         for c, p in enumerate(paths):
             try:
-                cropped, _ = tight_crop_image(Image.open(p).convert("RGB"))
+                cropped, info = tight_crop_image(Image.open(p).convert("RGB"))
             except Exception:  # noqa: BLE001
                 continue
             grid.paste(cropped, (c * cell, r * cell))
+            # Per-tile type label, bottom-left.
+            tile_label = "fallback" if info["fallback"] else info["type"]
+            ty = r * cell + cell - 18
+            draw.rectangle([c * cell + 2, ty, c * cell + 78, ty + 16], fill=(0, 0, 0))
+            draw.text((c * cell + 5, ty + 3), tile_label, fill=(255, 220, 120))
         # Source label, top-left of the row.
         draw.rectangle([2, r * cell + 2, 86, r * cell + 20], fill=(0, 0, 0))
         draw.text((6, r * cell + 6), src, fill=(255, 255, 255))
