@@ -451,12 +451,146 @@ def _rows_for(df: pd.DataFrame, patient_ids) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Tight-crop preprocessing — equalize framing across sources
+# ---------------------------------------------------------------------------
+def foreground_fraction(img, thresh: int = None) -> float:
+    """Fraction of non-black (eyelid) pixels: grayscale brightness > thresh."""
+    thresh = config.TIGHT_CROP_BLACK_THRESHOLD if thresh is None else thresh
+    gray = np.asarray(img.convert("L"))
+    return float((gray > thresh).mean())
+
+
+def tight_crop_image(img, size: int = None, margin: float = None,
+                     thresh: int = None, min_fg: int = None):
+    """Crop to the non-black foreground bbox (+margin) and resize to a square.
+
+    Detects the eyelid as pixels brighter than `thresh`, takes that region's
+    bounding box, pads it by `margin` (fraction of bbox size), crops, and resizes
+    to `size`x`size`. So the eyelid fills the frame the same way for every source.
+
+    Returns (cropped_resized_RGB_image, used_fallback). Falls back to a plain
+    resize of the original when the image is all-black or the mask is tiny.
+    """
+    size = config.IMAGE_SIZE if size is None else size
+    margin = config.TIGHT_CROP_MARGIN if margin is None else margin
+    thresh = config.TIGHT_CROP_BLACK_THRESHOLD if thresh is None else thresh
+    min_fg = config.TIGHT_CROP_MIN_FG_PIXELS if min_fg is None else min_fg
+
+    rgb = img.convert("RGB")
+    gray = np.asarray(rgb.convert("L"))
+    mask = gray > thresh
+    if int(mask.sum()) < min_fg:
+        # All-black or a speck of noise — nothing reliable to crop to.
+        return rgb.resize((size, size)), True
+
+    H, W = gray.shape
+    ys, xs = np.where(mask)
+    x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+    mx = int(round((x1 - x0 + 1) * margin))
+    my = int(round((y1 - y0 + 1) * margin))
+    x0 = max(0, x0 - mx); y0 = max(0, y0 - my)
+    x1 = min(W - 1, x1 + mx); y1 = min(H - 1, y1 + my)
+    crop = rgb.crop((x0, y0, x1 + 1, y1 + 1))
+    return crop.resize((size, size)), False
+
+
+class TightCrop:
+    """Picklable transform wrapper (lambdas aren't picklable for DataLoader
+    workers). Applies tight_crop_image, returning just the cropped image."""
+
+    def __init__(self, size=None, margin=None, thresh=None, min_fg=None):
+        self.size = config.IMAGE_SIZE if size is None else size
+        self.margin = config.TIGHT_CROP_MARGIN if margin is None else margin
+        self.thresh = config.TIGHT_CROP_BLACK_THRESHOLD if thresh is None else thresh
+        self.min_fg = config.TIGHT_CROP_MIN_FG_PIXELS if min_fg is None else min_fg
+
+    def __call__(self, img):
+        return tight_crop_image(img, self.size, self.margin, self.thresh, self.min_fg)[0]
+
+
+def _sample_paths(sub: pd.DataFrame, cap):
+    """Deterministic, evenly-spaced sample of image_paths (or all if under cap)."""
+    paths = sub.drop_duplicates("image_path")["image_path"].tolist()
+    if cap and len(paths) > cap:
+        step = len(paths) / cap
+        paths = [paths[int(i * step)] for i in range(cap)]
+    return paths
+
+
+def foreground_report(df: pd.DataFrame, sample_per_source: int = 250,
+                      verbose: bool = True) -> dict:
+    """Median foreground fraction (eyelid px / total) per source, BEFORE vs AFTER
+    the tight crop — confirms framing differed and is now equalized. Also counts
+    fallbacks (all-black / tiny-mask images). Samples up to `sample_per_source`
+    images per source so it stays fast on the real data."""
+    if verbose:
+        print("\n[crop] Foreground fraction (eyelid px / total) — median per source:")
+        print(f"  {'source':6} {'n':>5} {'before':>8} {'after':>8}  fallbacks")
+    out = {}
+    for src in SOURCE_ORDER:
+        sub = df[df["source"] == src]
+        if sub.empty:
+            continue
+        before, after, fallbacks = [], [], 0
+        for p in _sample_paths(sub, sample_per_source):
+            try:
+                img = Image.open(p).convert("RGB")
+            except Exception:  # noqa: BLE001
+                continue
+            before.append(foreground_fraction(img))
+            cropped, used_fb = tight_crop_image(img)
+            after.append(foreground_fraction(cropped))
+            fallbacks += int(used_fb)
+        if not before:
+            continue
+        mb, ma = float(np.median(before)), float(np.median(after))
+        out[src] = {"before_median": mb, "after_median": ma,
+                    "fallbacks": fallbacks, "n": len(before)}
+        if verbose:
+            print(f"  {src:6} {len(before):>5} {mb:>8.3f} {ma:>8.3f}  {fallbacks}")
+    return out
+
+
+def save_crop_preview(df: pd.DataFrame, path=None, per_source: int = 4):
+    """Save a (sources x per_source) grid of CROPPED images so all three sources
+    can be eyeballed side by side. Default: results/crop_preview.png."""
+    from PIL import ImageDraw
+
+    path = Path(path) if path else (config.RESULTS_DIR / "crop_preview.png")
+    sources = [s for s in SOURCE_ORDER if (df["source"] == s).any()]
+    cell = config.IMAGE_SIZE
+    grid = Image.new("RGB", (per_source * cell, len(sources) * cell), (15, 15, 18))
+    draw = ImageDraw.Draw(grid)
+
+    for r, src in enumerate(sources):
+        paths = (df[df["source"] == src].drop_duplicates("patient_id")
+                 ["image_path"].tolist()[:per_source])
+        for c, p in enumerate(paths):
+            try:
+                cropped, _ = tight_crop_image(Image.open(p).convert("RGB"))
+            except Exception:  # noqa: BLE001
+                continue
+            grid.paste(cropped, (c * cell, r * cell))
+        # Source label, top-left of the row.
+        draw.rectangle([2, r * cell + 2, 86, r * cell + 20], fill=(0, 0, 0))
+        draw.text((6, r * cell + 6), src, fill=(255, 255, 255))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grid.save(path)
+    print(f"[crop] preview grid saved to {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # 4. Dataset + DataLoaders
 # ---------------------------------------------------------------------------
 def _build_transforms(train: bool):
-    base = [
-        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
-    ]
+    base = []
+    if config.PREPROCESS_TIGHT_CROP:
+        # Equalize framing first; outputs a config.IMAGE_SIZE square.
+        base.append(TightCrop())
+    # No-op when already cropped to size; the real resize when cropping is off.
+    base.append(transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)))
     if train:
         # Light, label-preserving augmentation. Conjunctiva color is the signal,
         # so we avoid aggressive color jitter that could destroy pallor cues.

@@ -161,6 +161,21 @@ NORM_MEAN = (0.485, 0.456, 0.406)
 NORM_STD = (0.229, 0.224, 0.225)
 
 # ---------------------------------------------------------------------------
+# 4b. Tight-crop preprocessing  (v1 stage one: equalize framing across sources)
+# ---------------------------------------------------------------------------
+# All images are conjunctiva cutouts on a BLACK background, but framing differs
+# by source (India/Italy: small eyelid in lots of black; Ghana: eyelid fills the
+# frame). That lets the model ID the source from aspect ratio / black-fraction
+# instead of reading pallor. Tight-cropping to the eyelid bbox + resizing to a
+# fixed square makes every source look the same.
+#
+# Toggle this to run crossval with cropping ON vs OFF and compare.
+PREPROCESS_TIGHT_CROP = True
+TIGHT_CROP_MARGIN = 0.05          # ~5% padding around the detected eyelid bbox
+TIGHT_CROP_BLACK_THRESHOLD = 20   # grayscale brightness > this counts as eyelid
+TIGHT_CROP_MIN_FG_PIXELS = 64     # fewer foreground px -> treat as all-black, fall back
+
+# ---------------------------------------------------------------------------
 # 5. Training
 # ---------------------------------------------------------------------------
 SEED = 42
