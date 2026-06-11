@@ -67,7 +67,7 @@ def main():
     records = []
     for i in test_idx:
         row = df.loc[i]
-        true_hb = float(row["hb"])
+        true_hb = float(row["hgb"])
         gender = row["gender"]
         cutoff = config.anemia_cutoff(gender)  # gender-aware: <12 F, <13 M
         pred_hb = _predict_hb(model, transform, row["image_path"], device)

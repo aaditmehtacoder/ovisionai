@@ -88,6 +88,46 @@ PALPEBRAL_SUFFIX = "_palpebral.png"
 PALPEBRAL_EXCLUDE = ("forniceal",)
 
 # ---------------------------------------------------------------------------
+# 2b. CP-AnemiC dataset (second source — children, Ghana)
+# ---------------------------------------------------------------------------
+# Layout (under CPANEMIC_ROOT):
+#   Anemic/<IMAGE_ID>.png        (label = anemic)
+#   Non-anemic/<IMAGE_ID>.png    (label = non-anemic)
+#   Anemia_Data_Collection_Sheet.xlsx  with columns
+#       IMAGE_ID, HB_LEVEL, Severity, Age(Months), GENDER, REMARK, COUNTRY, ...
+# Each row links to <IMAGE_ID>.png in whichever of the two folders holds it.
+# HB_LEVEL is the regression target; GENDER is "Male"/"Female" (normalized M/F);
+# Age is in MONTHS (children) — so these rows are age_group "child".
+#
+# Configurable via OVISION_CPANEMIC_ROOT, defaulting to the Kaggle path below.
+_KAGGLE_CPANEMIC_ROOT = Path(
+    "/kaggle/input/datasets/karankumar4090/cp-anemic-dataset-same"
+)
+
+
+def get_cpanemic_root() -> Path:
+    env_override = os.environ.get("OVISION_CPANEMIC_ROOT")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    return _KAGGLE_CPANEMIC_ROOT
+
+
+CPANEMIC_ROOT = get_cpanemic_root()
+CPANEMIC_SHEET = "Anemia_Data_Collection_Sheet.xlsx"
+CPANEMIC_IMAGE_FOLDERS = ("Anemic", "Non-anemic")  # folder name decides the label
+CPANEMIC_IMAGE_ID_COL = "IMAGE_ID"
+CPANEMIC_HB_COL = "HB_LEVEL"
+CPANEMIC_GENDER_COL = "GENDER"
+CPANEMIC_SOURCE = "ghana"  # CP-AnemiC rows all carry this source label
+
+# ---------------------------------------------------------------------------
+# 2c. Which datasets to load / pool
+# ---------------------------------------------------------------------------
+# Controls build_dataframe(). Default loads BOTH and pools them. To train on one
+# alone, set to a single-element tuple, e.g. ("eyes_defy",) or ("cp_anemic",).
+DATASETS = ("eyes_defy", "cp_anemic")
+
+# ---------------------------------------------------------------------------
 # 3. Task mode  (this dataset is regression)
 # ---------------------------------------------------------------------------
 # "regression"     -> predict Hgb (g/dL), then threshold to a class for metrics.

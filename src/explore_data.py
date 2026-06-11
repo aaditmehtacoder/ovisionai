@@ -236,8 +236,8 @@ def explore_label_distribution(root: Path) -> None:
         counts = df["anemic"].value_counts(dropna=False).to_dict()
         print(f"\nAnemia label counts (1=anemic, 0=non-anemic): {counts}")
 
-    if "hb" in df.columns and df["hb"].notna().any():
-        hb = df["hb"].dropna()
+    if "hgb" in df.columns and df["hgb"].notna().any():
+        hb = df["hgb"].dropna()
         print("\nHemoglobin (g/dL) summary:")
         print(f"  n={len(hb)}  min={hb.min():.1f}  max={hb.max():.1f}  "
               f"mean={hb.mean():.1f}  median={hb.median():.1f}")

@@ -291,8 +291,8 @@ def build_examples(n_anemic: int = 3, n_healthy: int = 3):
 
     # One image per patient so the gallery shows distinct patients.
     df = df.drop_duplicates("patient_id")
-    anemic = df[df["anemic"] == 1].nsmallest(n_anemic, "hb")   # clearly low Hgb
-    healthy = df[df["anemic"] == 0].nlargest(n_healthy, "hb")  # clearly normal
+    anemic = df[df["anemic"] == 1].nsmallest(n_anemic, "hgb")   # clearly low Hgb
+    healthy = df[df["anemic"] == 0].nlargest(n_healthy, "hgb")  # clearly normal
     import pandas as pd
     chosen = pd.concat([anemic, healthy])
     if len(chosen) < 2:
@@ -303,7 +303,7 @@ def build_examples(n_anemic: int = 3, n_healthy: int = 3):
         gender = r["gender"] if r["gender"] in ("F", "M") else "F"
         status = "anemic" if r["anemic"] == 1 else "healthy"
         examples.append([r["image_path"], gender])
-        labels.append(f'{r["patient_id"]} · {gender} · Hgb {r["hb"]:.1f} ({status})')
+        labels.append(f'{r["patient_id"]} · {gender} · Hgb {r["hgb"]:.1f} ({status})')
     return examples, labels
 
 
