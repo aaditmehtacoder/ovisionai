@@ -1,0 +1,14 @@
+# OVision v0 — plain PyTorch baseline. No Docker, no extra frameworks.
+# Tested with Python 3.10+. On Kaggle most of these are preinstalled.
+
+torch>=2.0
+torchvision>=0.15
+numpy>=1.23
+pandas>=1.5
+pillow>=9.0
+scikit-learn>=1.2      # metrics: AUC, confusion matrix
+tqdm>=4.64             # progress bars
+
+# Optional — only needed if you pass --wandb. Safe to leave installed; the code
+# runs fine without a W&B account when the flag is off.
+wandb>=0.15
