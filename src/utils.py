@@ -93,13 +93,17 @@ def classification_metrics(y_true, y_prob, threshold: float = 0.5) -> dict:
     }
 
 
-def regression_metrics(y_true_hb, y_pred_hb, anemia_threshold: float) -> dict:
+def regression_metrics(y_true_hb, y_pred_hb, anemia_threshold, genders=None) -> dict:
     """
     Metrics for hemoglobin regression.
 
     Reports MAE/RMSE on Hb, then thresholds both true and predicted Hb at the
     anemia cutoff to derive the same screening sensitivity/specificity a
     clinician cares about.
+
+    `anemia_threshold` is either a scalar cutoff (g/dL) OR, when `genders` is
+    given, a per-sample cutoff array — pass `config.anemia_cutoff(g)` per gender
+    so the anemic call is gender-aware (e.g. <12 for F, <13 for M).
     """
     y_true_hb = np.asarray(y_true_hb, dtype=float)
     y_pred_hb = np.asarray(y_pred_hb, dtype=float)
@@ -107,21 +111,31 @@ def regression_metrics(y_true_hb, y_pred_hb, anemia_threshold: float) -> dict:
     mae = float(np.mean(np.abs(y_pred_hb - y_true_hb)))
     rmse = float(np.sqrt(np.mean((y_pred_hb - y_true_hb) ** 2)))
 
-    # Below threshold => anemic (positive class).
-    true_anemic = (y_true_hb < anemia_threshold).astype(int)
-    pred_anemic = (y_pred_hb < anemia_threshold).astype(int)
-    # Use predicted Hb's "distance below threshold" as a pseudo-probability so
-    # we can still get an AUC-style number from the regression head.
-    pseudo_prob = anemia_threshold - y_pred_hb
-    pseudo_prob = (pseudo_prob - pseudo_prob.min()) / (np.ptp(pseudo_prob) + 1e-8)
+    # Per-sample cutoff vector (gender-aware when `genders` is supplied).
+    cutoff = np.asarray(anemia_threshold, dtype=float)
+    if cutoff.ndim == 0:
+        cutoff = np.full_like(y_true_hb, float(anemia_threshold))
 
-    cls = classification_metrics(true_anemic, pseudo_prob, threshold=_prob_at_cutoff(
-        y_pred_hb, anemia_threshold, pseudo_prob))
+    # Below the cutoff => anemic (positive class).
+    true_anemic = (y_true_hb < cutoff).astype(int)
+    # "Distance below cutoff" doubles as a pseudo-probability so we can still get
+    # an AUC-style number from the regression head; 0 distance == exactly at the
+    # cutoff, which is the decision boundary.
+    raw = cutoff - y_pred_hb
+    lo, span = raw.min(), (np.ptp(raw) + 1e-8)
+    pseudo_prob = (raw - lo) / span
+    boundary = float((0.0 - lo) / span)
 
+    cls = classification_metrics(true_anemic, pseudo_prob, threshold=boundary)
+
+    reported_threshold = (
+        float(anemia_threshold) if cutoff.size and np.all(cutoff == cutoff[0])
+        else "gender-aware"
+    )
     return {
         "hb_mae": mae,
         "hb_rmse": rmse,
-        "anemia_threshold": float(anemia_threshold),
+        "anemia_threshold": reported_threshold,
         # Screening metrics derived from thresholded Hb:
         "sensitivity": cls["sensitivity"],
         "specificity": cls["specificity"],
@@ -130,13 +144,6 @@ def regression_metrics(y_true_hb, y_pred_hb, anemia_threshold: float) -> dict:
         "confusion_matrix": cls["confusion_matrix"],
         "n": int(len(y_true_hb)),
     }
-
-
-def _prob_at_cutoff(y_pred_hb, anemia_threshold, pseudo_prob) -> float:
-    """The pseudo-probability value that corresponds exactly to Hb == cutoff."""
-    raw = anemia_threshold - np.asarray(y_pred_hb, dtype=float)
-    lo, span = raw.min(), (np.ptp(raw) + 1e-8)
-    return float((0.0 - lo) / span)
 
 
 # ---------------------------------------------------------------------------

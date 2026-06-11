@@ -1,24 +1,32 @@
 """
-data.py — turn the (unknown-structure) dataset into PyTorch DataLoaders.
+data.py — turn the real Eyes-defy-anemia dataset into PyTorch DataLoaders.
+
+Real layout (under config.DATA_ROOT):
+    India/  India.xlsx   India/<Number>/<images>
+    Italy/  Italy.xlsx   Italy/<Number>/<images>
+
+Each spreadsheet row (columns Number, Hgb, Gender, Age) describes one patient
+whose images live in the folder named after their Number. We use ONLY the
+pre-cropped eyelid image ending in "_palpebral.png".
 
 The flow:
-  1. build_dataframe()  -> a tidy DataFrame with columns:
-        image_path : absolute path to the image
-        anemic     : 0/1 or NaN
-        hb         : float g/dL or NaN
-     It discovers metadata via config.METADATA_CANDIDATES + column candidates,
-     and falls back to folder-name labels if no usable CSV exists.
-  2. resolve_task()     -> picks "classification" or "regression" when TASK="auto".
-  3. make_or_load_splits() -> frozen train/val/test split saved to disk.
-  4. get_dataloaders()  -> ready-to-train DataLoaders.
-
-WHERE TO ADJUST after running explore_data.py: almost everything is driven by
-config.py (METADATA_CANDIDATES, IMAGE_COL, ANEMIA_COL, HB_COL, *_FOLDER_HINTS).
-You should rarely need to touch the logic here.
+  1. build_dataframe()      -> one row per usable image, with columns:
+         image_path : absolute path to the *_palpebral.png crop
+         patient_id : "<Country>/<Number>" — unique per patient
+         country, number, gender, age
+         hb         : float Hgb (regression target)
+         anemic     : ground-truth anemic flag from the gender-aware cutoff
+     Patients missing a folder, a _palpebral.png, or a usable Hgb are skipped
+     gracefully and counted (printed at the end).
+  2. resolve_task()         -> "regression" (Hgb values present).
+  3. make_or_load_splits()  -> frozen PATIENT-LEVEL train/val/test split. All
+     of a patient's images stay on the SAME side. Saved to config.SPLIT_PATH.
+  4. get_dataloaders()      -> ready-to-train DataLoaders.
 """
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +42,7 @@ from utils import seed_worker  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 1. Discover labels -> tidy dataframe
+# 1. Walk the real structure -> tidy dataframe (one row per usable image)
 # ---------------------------------------------------------------------------
 def build_dataframe(verbose: bool = False) -> pd.DataFrame:
     root = config.DATA_ROOT
@@ -44,144 +52,162 @@ def build_dataframe(verbose: bool = False) -> pd.DataFrame:
             f"OVISION_DATA_ROOT."
         )
 
-    # Index every image by basename so we can join metadata rows to real files.
-    image_paths = [
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in config.IMAGE_EXTENSIONS
-    ]
-    if not image_paths:
-        raise FileNotFoundError(f"No images found under {root}")
-    by_name = {p.name: p for p in image_paths}
-    by_stem = {p.stem: p for p in image_paths}  # filename without extension
-
-    meta_path = _find_metadata(root)
-    if meta_path is not None:
-        if verbose:
-            print(f"[data] Using metadata file: {meta_path}")
-        df = _dataframe_from_metadata(meta_path, by_name, by_stem, verbose)
-    else:
-        if verbose:
-            print("[data] No metadata file found — using folder-name labels.")
-        df = _dataframe_from_folders(image_paths, verbose)
-
-    # Keep only rows that have at least one usable label.
-    has_label = df["anemic"].notna() | df["hb"].notna()
-    df = df[has_label].reset_index(drop=True)
-    if df.empty:
-        raise ValueError(
-            "Found images but could not attach any labels. Check the column / "
-            "folder-name settings in config.py against explore_data.py output."
-        )
-    if verbose:
-        print(f"[data] {len(df)} labeled images assembled.")
-    return df
-
-
-def _find_metadata(root: Path):
-    """Return the first existing metadata file from config.METADATA_CANDIDATES."""
-    # Exact-name candidates first (anywhere in the tree).
-    for name in config.METADATA_CANDIDATES:
-        matches = sorted(root.rglob(name))
-        if matches:
-            return matches[0]
-    # Otherwise: any CSV at all, so a differently-named file still gets noticed.
-    csvs = sorted(root.rglob("*.csv"))
-    return csvs[0] if csvs else None
-
-
-def _pick_column(df: pd.DataFrame, preferred: str, candidates) -> str | None:
-    """Find a column matching `preferred` or any candidate, case-insensitively."""
-    lower = {c.lower(): c for c in df.columns}
-    for name in (preferred, *candidates):
-        if name.lower() in lower:
-            return lower[name.lower()]
-    return None
-
-
-def _dataframe_from_metadata(meta_path, by_name, by_stem, verbose) -> pd.DataFrame:
-    raw = pd.read_csv(meta_path)
-
-    img_col = _pick_column(raw, config.IMAGE_COL, config.IMAGE_COL_CANDIDATES)
-    anemia_col = _pick_column(raw, config.ANEMIA_COL, config.ANEMIA_COL_CANDIDATES)
-    hb_col = _pick_column(raw, config.HB_COL, config.HB_COL_CANDIDATES)
-
-    if verbose:
-        print(f"[data] columns -> image:{img_col}  anemic:{anemia_col}  hb:{hb_col}")
-    if img_col is None:
-        raise ValueError(
-            f"No image-filename column found in {meta_path}. Columns are "
-            f"{list(raw.columns)}. Set IMAGE_COL in config.py."
-        )
-
     rows = []
-    unmatched = 0
-    for _, r in raw.iterrows():
-        path = _match_image(str(r[img_col]), by_name, by_stem)
-        if path is None:
-            unmatched += 1
+    # Patient-level bookkeeping so we can report honest usable N.
+    kept = 0
+    skipped_no_folder = 0
+    skipped_no_image = 0
+    skipped_bad_hb = 0
+    seen_patients = 0
+
+    for country in config.COUNTRIES:
+        sheet = config.spreadsheet_path(root, country)
+        if not sheet.exists():
+            if verbose:
+                print(f"[data] {country}: spreadsheet not found at {sheet} — skipping country.")
             continue
-        rows.append({
-            "image_path": str(path),
-            "anemic": _to_binary(r[anemia_col]) if anemia_col else np.nan,
-            "hb": _to_float(r[hb_col]) if hb_col else np.nan,
-        })
-    if verbose and unmatched:
-        print(f"[data] {unmatched} metadata rows had no matching image file.")
+
+        table = _read_spreadsheet(sheet)
+        if verbose:
+            print(f"[data] {country}: {len(table)} spreadsheet rows from {sheet.name}")
+
+        for _, r in table.iterrows():
+            seen_patients += 1
+            number = _clean_number(r["number"])
+            if number is None:
+                skipped_no_folder += 1
+                continue
+
+            hb = _to_float(r["hb"])
+            if hb is None or not np.isfinite(hb):
+                skipped_bad_hb += 1
+                continue
+
+            folder = root / country / number
+            if not folder.is_dir():
+                skipped_no_folder += 1
+                continue
+
+            images = _palpebral_images(folder)
+            if not images:
+                skipped_no_image += 1
+                continue
+
+            gender = _clean_gender(r["gender"])
+            age = _to_float(r["age"])
+            patient_id = f"{country}/{number}"
+            anemic = float(hb < config.anemia_cutoff(gender)) if gender else np.nan
+
+            kept += 1
+            for img in images:
+                rows.append({
+                    "image_path": str(img),
+                    "patient_id": patient_id,
+                    "country": country,
+                    "number": number,
+                    "gender": gender,
+                    "age": age,
+                    "hb": hb,
+                    "anemic": anemic,
+                })
+
+    skipped = skipped_no_folder + skipped_no_image + skipped_bad_hb
+    print(
+        f"[data] Patients seen: {seen_patients}  kept: {kept}  skipped: {skipped} "
+        f"(no/invalid folder: {skipped_no_folder}, no _palpebral.png: "
+        f"{skipped_no_image}, unusable Hgb: {skipped_bad_hb})"
+    )
 
     df = pd.DataFrame(rows)
-    # If we have Hb but no explicit anemic label, derive it from the threshold.
-    if "hb" in df and df["anemic"].isna().all() and df["hb"].notna().any():
-        df["anemic"] = (df["hb"] < config.ANEMIA_HB_THRESHOLD).astype(float)
-        df.loc[df["hb"].isna(), "anemic"] = np.nan
+    if df.empty:
+        raise ValueError(
+            "Walked the dataset but assembled 0 usable rows. Check DATA_ROOT / "
+            "OVISION_DATA_ROOT and the structure constants in config.py."
+        )
+
+    if verbose:
+        per_country = Counter(df["country"])
+        print(f"[data] Usable images: {len(df)} from {df['patient_id'].nunique()} "
+              f"patients  ({dict(per_country)} images per country)")
     return df
 
 
-def _dataframe_from_folders(image_paths, verbose) -> pd.DataFrame:
-    """Label each image from hints in its folder path (no CSV available)."""
-    rows = []
-    for p in image_paths:
-        path_str = str(p).lower()
-        anemic = np.nan
-        if any(h in path_str for h in config.NONANEMIC_FOLDER_HINTS):
-            anemic = 0.0
-        if any(h in path_str for h in config.ANEMIC_FOLDER_HINTS):
-            anemic = 1.0  # anemic hint wins if both somehow match
-        rows.append({"image_path": str(p), "anemic": anemic, "hb": np.nan})
-    return pd.DataFrame(rows)
+def _read_spreadsheet(path: Path) -> pd.DataFrame:
+    """Read a country spreadsheet, keeping ONLY Number/Hgb/Gender/Age.
+
+    Italy's sheet carries extra junk "Unnamed" columns; matching the wanted
+    columns case-insensitively by name ignores them. Returns a frame with
+    canonical lowercase column names: number, hb, gender, age.
+    """
+    raw = pd.read_excel(path)
+    lower = {str(c).strip().lower(): c for c in raw.columns}
+
+    def col(name):
+        c = lower.get(name.lower())
+        return raw[c] if c is not None else pd.Series([np.nan] * len(raw))
+
+    return pd.DataFrame({
+        "number": col(config.NUMBER_COL),
+        "hb": col(config.HB_COL),
+        "gender": col(config.GENDER_COL),
+        "age": col(config.AGE_COL),
+    })
 
 
-def _match_image(name: str, by_name: dict, by_stem: dict):
-    name = name.strip()
-    base = Path(name).name
-    if base in by_name:
-        return by_name[base]
-    stem = Path(base).stem
-    if stem in by_stem:
-        return by_stem[stem]
-    return None
+def _palpebral_images(folder: Path) -> list:
+    """All usable palpebral crops in a patient folder.
+
+    A file qualifies if its name ends in config.PALPEBRAL_SUFFIX and contains
+    none of config.PALPEBRAL_EXCLUDE (so "_forniceal_palpebral.png" is dropped).
+    """
+    out = []
+    for p in sorted(folder.iterdir()):
+        if not p.is_file():
+            continue
+        name = p.name.lower()
+        if not name.endswith(config.PALPEBRAL_SUFFIX):
+            continue
+        if any(bad in name for bad in config.PALPEBRAL_EXCLUDE):
+            continue
+        out.append(p)
+    return out
 
 
-def _to_binary(value):
-    """Coerce assorted anemia encodings (1/0, yes/no, anemic/normal) to 0/1."""
+def _clean_number(value):
+    """Normalize a spreadsheet Number into a folder-name string ('12'), or None."""
     if pd.isna(value):
-        return np.nan
-    s = str(value).strip().lower()
-    if s in ("1", "1.0", "yes", "y", "true", "anemic", "anaemic", "positive", "pos"):
-        return 1.0
-    if s in ("0", "0.0", "no", "n", "false", "non-anemic", "normal", "healthy",
-             "negative", "neg", "control"):
-        return 0.0
+        return None
+    # Numbers often read back as floats (12.0); render whole numbers cleanly.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    s = str(value).strip()
+    if not s:
+        return None
     try:
-        return float(float(s) > 0)
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
     except ValueError:
-        return np.nan
+        pass
+    return s
+
+
+def _clean_gender(value):
+    """Normalize gender to 'M' / 'F' (single uppercase letter), or '' if unknown."""
+    if pd.isna(value):
+        return ""
+    s = str(value).strip().upper()
+    return s[:1] if s[:1] in ("M", "F") else ""
 
 
 def _to_float(value):
+    """Coerce a possibly-string value (e.g. '15') to float, or None."""
+    if pd.isna(value):
+        return None
     try:
-        return float(value)
+        return float(str(value).strip())
     except (TypeError, ValueError):
-        return np.nan
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -189,80 +215,77 @@ def _to_float(value):
 # ---------------------------------------------------------------------------
 def resolve_task(df: pd.DataFrame, requested: str = None) -> str:
     requested = requested or config.TASK
-    if requested == "regression":
-        if df["hb"].notna().sum() < 2:
-            raise ValueError("Regression requested but no Hb values found.")
-        return "regression"
     if requested == "classification":
         if df["anemic"].notna().sum() < 2:
             raise ValueError("Classification requested but no anemia labels found.")
         return "classification"
-    # auto: prefer regression when real Hb values exist, else classification.
-    if df["hb"].notna().sum() >= max(10, 0.5 * len(df)):
+    if requested == "regression":
+        if df["hb"].notna().sum() < 2:
+            raise ValueError("Regression requested but no Hgb values found.")
+        return "regression"
+    # auto: prefer regression when real Hgb values exist.
+    if df["hb"].notna().sum() >= 2:
         return "regression"
     return "classification"
 
 
 # ---------------------------------------------------------------------------
-# 3. Frozen splits (HARD REQUIREMENT: saved to disk, stable across runs)
+# 3. Frozen PATIENT-LEVEL split (HARD REQUIREMENT)
 # ---------------------------------------------------------------------------
-def make_or_load_splits(df: pd.DataFrame, task: str) -> dict:
+def make_or_load_splits(df: pd.DataFrame, task: str = None) -> dict:
     """
     Returns {"train": [idx...], "val": [...], "test": [...]} indexing into df.
 
-    Split is keyed by image_path so it stays stable even if df row order changes.
-    Computed once and cached at config.SPLIT_PATH; reused on every later run.
+    The split is keyed by patient_id: every image of a patient lands in exactly
+    one split, so a patient can NEVER appear in both train and test. Computed
+    once and cached at config.SPLIT_PATH (as patient_id lists), reused after.
     """
-    path_to_idx = {row.image_path: i for i, row in df.iterrows()}
+    patients = sorted(df["patient_id"].unique())
 
+    saved_patients = None
     if config.SPLIT_PATH.exists():
         saved = json.loads(config.SPLIT_PATH.read_text())
-        splits = {}
-        for name in ("train", "val", "test"):
-            splits[name] = [path_to_idx[p] for p in saved[name] if p in path_to_idx]
-        missing = len(df) - sum(len(v) for v in splits.values())
-        if missing == 0:
-            print(f"[data] Loaded frozen split from {config.SPLIT_PATH}")
+        saved_patients = {p for grp in saved.values() for p in grp}
+        if saved_patients == set(patients):
+            splits = {name: _rows_for(df, saved[name]) for name in ("train", "val", "test")}
+            print(f"[data] Loaded frozen patient-level split from {config.SPLIT_PATH}")
             return splits
-        print(f"[data] Saved split is stale ({missing} new/changed images) — "
-              f"recomputing.")
+        print(f"[data] Saved split no longer matches the patient set "
+              f"({len(saved_patients)} saved vs {len(patients)} now) — recomputing.")
 
-    splits = _stratified_split(df, task)
-
-    # Persist by image_path (not index) so the split survives reordering.
-    saveable = {
-        name: [df.loc[i, "image_path"] for i in idxs]
-        for name, idxs in splits.items()
-    }
+    patient_splits = _split_patients(patients)
     config.SPLIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    config.SPLIT_PATH.write_text(json.dumps(saveable, indent=2))
-    print(f"[data] Saved frozen split to {config.SPLIT_PATH}")
-    return splits
+    config.SPLIT_PATH.write_text(json.dumps(patient_splits, indent=2))
+    print(f"[data] Saved frozen patient-level split to {config.SPLIT_PATH}")
+
+    return {name: _rows_for(df, patient_splits[name]) for name in ("train", "val", "test")}
 
 
-def _stratified_split(df: pd.DataFrame, task: str) -> dict:
-    """Seeded split; stratified on the anemia label when available."""
+def _split_patients(patients: list) -> dict:
+    """Seeded patient-level split into train/val/test by config.SPLIT_RATIOS."""
     rng = np.random.default_rng(config.SEED)
+    order = np.array(patients, dtype=object)
+    rng.shuffle(order)
+
+    n = len(order)
     ratios = config.SPLIT_RATIOS
+    n_train = int(round(ratios["train"] * n))
+    n_val = int(round(ratios["val"] * n))
+    # Guard tiny datasets so val/test aren't starved when n is small.
+    n_train = min(n_train, max(n - 2, 0))
+    n_val = min(n_val, max(n - n_train - 1, 0))
 
-    # Stratify on the binary label so each split has both classes when possible.
-    if df["anemic"].notna().all() and df["anemic"].nunique() > 1:
-        groups = [df.index[df["anemic"] == c].to_numpy() for c in sorted(df["anemic"].unique())]
-    else:
-        groups = [df.index.to_numpy()]
+    return {
+        "train": sorted(order[:n_train].tolist()),
+        "val": sorted(order[n_train:n_train + n_val].tolist()),
+        "test": sorted(order[n_train + n_val:].tolist()),
+    }
 
-    train, val, test = [], [], []
-    for g in groups:
-        g = g.copy()
-        rng.shuffle(g)
-        n = len(g)
-        n_train = int(round(ratios["train"] * n))
-        n_val = int(round(ratios["val"] * n))
-        train.extend(g[:n_train])
-        val.extend(g[n_train:n_train + n_val])
-        test.extend(g[n_train + n_val:])
 
-    return {"train": sorted(train), "val": sorted(val), "test": sorted(test)}
+def _rows_for(df: pd.DataFrame, patient_ids) -> list:
+    """All df row indices belonging to the given patient_ids."""
+    wanted = set(patient_ids)
+    return df.index[df["patient_id"].isin(wanted)].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +310,8 @@ def _build_transforms(train: bool):
 
 
 class ConjunctivaDataset(Dataset):
-    """Yields (image_tensor, target). Target is the anemia label for
-    classification, or the Hb value for regression."""
+    """Yields (image_tensor, target). Target is the Hgb value for regression,
+    or the anemic label for classification."""
 
     def __init__(self, df: pd.DataFrame, indices, task: str, train: bool):
         self.df = df
@@ -329,6 +352,14 @@ def get_dataloaders(df: pd.DataFrame, task: str, splits: dict):
             drop_last=False,
         )
     return loaders
+
+
+def genders_for_split(df: pd.DataFrame, indices) -> np.ndarray:
+    """Gender per sample in the SAME order a (shuffle=False) loader yields them.
+
+    Lets train/evaluate apply the gender-aware anemia cutoff to predictions.
+    """
+    return np.array([df.loc[i, "gender"] for i in indices], dtype=object)
 
 
 # Convenience: assemble everything in one call.

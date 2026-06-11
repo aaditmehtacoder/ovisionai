@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
-from data import prepare_data  # noqa: E402
+from data import genders_for_split, prepare_data  # noqa: E402
 from model import OVisionModel, build_loss, save_checkpoint  # noqa: E402
 from utils import (  # noqa: E402
     classification_metrics,
@@ -80,10 +80,14 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
     )
 
 
-def compute_metrics(task, y_true, y_score):
+def compute_metrics(task, y_true, y_score, genders=None):
     if task == "classification":
         return classification_metrics(y_true, y_score)
-    return regression_metrics(y_true, y_score, config.ANEMIA_HB_THRESHOLD)
+    # Gender-aware anemia cutoff (<12 F, <13 M) when genders are available.
+    cutoff = config.ANEMIA_HB_THRESHOLD
+    if genders is not None:
+        cutoff = np.array([config.anemia_cutoff(g) for g in genders], dtype=float)
+    return regression_metrics(y_true, y_score, cutoff)
 
 
 def main():
@@ -106,6 +110,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
                                  weight_decay=config.WEIGHT_DECAY)
 
+    # Genders aligned with the (shuffle=False) val loader order, for the
+    # gender-aware anemia cutoff in regression metrics.
+    val_genders = genders_for_split(df, splits["val"]) if task == "regression" else None
+
     run = _init_wandb(args, task) if args.wandb else None
 
     # Lower-is-better selection metric for both tasks: val loss.
@@ -115,7 +123,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss, *_ = run_epoch(model, loaders["train"], criterion, device, optimizer)
         val_loss, vy, vs = run_epoch(model, loaders["val"], criterion, device)
-        val_metrics = compute_metrics(task, vy, vs)
+        val_metrics = compute_metrics(task, vy, vs, val_genders)
 
         key = "auc" if task == "classification" else "hb_mae"
         print(f"epoch {epoch:3d}/{args.epochs}  "

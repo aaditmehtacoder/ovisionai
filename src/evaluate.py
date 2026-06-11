@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
-from data import prepare_data  # noqa: E402
+from data import genders_for_split, prepare_data  # noqa: E402
 from model import load_checkpoint  # noqa: E402
 from utils import (  # noqa: E402
     append_results_csv,
@@ -82,7 +82,11 @@ def main():
     if model.task == "classification":
         metrics = classification_metrics(y_true, y_score)
     else:
-        metrics = regression_metrics(y_true, y_score, config.ANEMIA_HB_THRESHOLD)
+        # Gender-aware anemia cutoff (<12 F, <13 M), aligned with the
+        # (shuffle=False) test loader order.
+        test_genders = genders_for_split(df, splits["test"])
+        cutoff = np.array([config.anemia_cutoff(g) for g in test_genders], dtype=float)
+        metrics = regression_metrics(y_true, y_score, cutoff)
 
     pretty_print_metrics(f"TEST metrics ({model.task}, n={metrics['n']})", metrics)
 
