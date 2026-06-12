@@ -1,5 +1,7 @@
 # OVision v0 — anemia screening baseline
 
+Quick fix on new branch thanks....
+
 A minimal, reproducible PyTorch baseline for estimating **anemia risk** from a
 smartphone photo of the **palpebral conjunctiva** (inner lower eyelid).
 Conjunctival pallor correlates with low hemoglobin, so: *photo in → anemia
