@@ -190,6 +190,31 @@ CONJ_MIN_VAL = 40                 # min brightness (ignore dark noise)
 CONJ_MIN_FRAC = 0.01              # raw mask must cover >= this fraction, else center-crop fallback
 
 # ---------------------------------------------------------------------------
+# 4c. Crop method selection  (rule-based default; SAM optional, opt-in)
+# ---------------------------------------------------------------------------
+# Which cropper data.py applies when PREPROCESS_TIGHT_CROP is on:
+#   "rule" -> the type-aware HSV/black-border crop above (tight_crop_image).
+#   "sam"  -> Meta's Segment-Anything, picking the mask that best overlaps the
+#             reddish conjunctiva, with an automatic fall-back to "rule" when SAM
+#             finds nothing confident or its weights can't be loaded.
+# Default "rule" so existing runs are byte-for-byte unchanged unless you opt in.
+# The "sam" path is meant for RAW whole-eye photos the rule cropper can't frame.
+CROP_METHOD = "rule"  # "rule" | "sam"
+
+# SAM (segment-anything) settings — only touched when CROP_METHOD == "sam".
+# vit_b is the smallest/fastest checkpoint; weights are ~375MB and download from
+# the public Meta URL on first use (no API key). Cached under CHECKPOINT_DIR
+# (gitignored). On Kaggle keep "Internet" ON so the first run can fetch them.
+SAM_MODEL_TYPE = "vit_b"
+SAM_CHECKPOINT_URL = (
+    "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+)
+SAM_CHECKPOINT_PATH = CHECKPOINT_DIR / "sam_vit_b_01ec64.pth"
+SAM_CROP_MARGIN = 0.05      # padding around the chosen SAM mask's bbox
+SAM_MASK_MIN_FRAC = 0.01    # mask must cover >= this image fraction, else fall back
+SAM_MIN_RED_SCORE = 0.15    # min reddish-overlap score to trust a mask, else fall back
+
+# ---------------------------------------------------------------------------
 # 5. Training
 # ---------------------------------------------------------------------------
 SEED = 42

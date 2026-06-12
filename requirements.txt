@@ -14,3 +14,13 @@ gradio>=4.0            # src/demo.py sanity-check UI
 # Optional — only needed if you pass --wandb. Safe to leave installed; the code
 # runs fine without a W&B account when the flag is off.
 wandb>=0.15
+
+# Optional — only needed when config.CROP_METHOD == "sam" (default is "rule", so
+# these are NOT required for the normal pipeline). Meta's Segment-Anything plus
+# its runtime dep power src/sam_crop.py. The vit_b checkpoint is ~375MB and
+# downloads FREE (no API key) on first use to checkpoints/sam_vit_b_01ec64.pth.
+# The import is guarded, so leaving these uninstalled just makes SAM crop fall
+# back to the rule-based crop.
+segment-anything>=1.0   # SAM: sam_model_registry + SamPredictor
+opencv-python>=4.6      # required by segment-anything at import time
+# (torch / torchvision / numpy / pillow above already cover SAM's other needs)

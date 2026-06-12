@@ -653,11 +653,22 @@ def save_crop_preview(df: pd.DataFrame, path=None, per_source: int = 4):
 # ---------------------------------------------------------------------------
 # 4. Dataset + DataLoaders
 # ---------------------------------------------------------------------------
+def _make_cropper():
+    """Pick the cropper per config.CROP_METHOD. "rule" (default) -> the built-in
+    TightCrop; "sam" -> the optional SAM cropper (lazy import so the SAM deps are
+    only needed when you opt in). Both output a config.IMAGE_SIZE square."""
+    method = getattr(config, "CROP_METHOD", "rule")
+    if method == "sam":
+        from sam_crop import SamCrop  # lazy: avoids importing SAM on the rule path
+        return SamCrop()
+    return TightCrop()
+
+
 def _build_transforms(train: bool):
     base = []
     if config.PREPROCESS_TIGHT_CROP:
         # Equalize framing first; outputs a config.IMAGE_SIZE square.
-        base.append(TightCrop())
+        base.append(_make_cropper())
     # No-op when already cropped to size; the real resize when cropping is off.
     base.append(transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)))
     if train:

@@ -45,7 +45,8 @@ ovision/
   config.py            ALL knobs: data path, column/folder names, task, training
   src/
     explore_data.py    RUN FIRST — discovers dataset structure + label stats
-    data.py            Dataset + DataLoaders + frozen split
+    data.py            Dataset + DataLoaders + frozen split + rule-based crop
+    sam_crop.py        OPTIONAL SAM conjunctiva cropper (config.CROP_METHOD="sam")
     model.py           ResNet18 / EfficientNet-B0 with switchable head
     train.py           training loop + checkpointing
     evaluate.py        held-out test scoring
@@ -136,3 +137,28 @@ common aliases, so often it just works without edits.
   split keeps runs comparable; don't over-read a single test number.
 - v0 uses the **whole image**. Improving past this is what Phase 2's
   segmentation stage is for.
+
+---
+
+## Crop method (optional SAM)
+
+Before the backbone, images are tight-cropped to the eyelid so framing doesn't
+leak source identity (`config.PREPROCESS_TIGHT_CROP`, on by default).
+`config.CROP_METHOD` picks how:
+
+- `"rule"` (default) — the built-in HSV / black-border cropper in `data.py`.
+  Nothing changes unless you opt in.
+- `"sam"` — Meta's [Segment-Anything](https://github.com/facebookresearch/segment-anything)
+  in [`src/sam_crop.py`](src/sam_crop.py), for **raw whole-eye photos** the rule
+  cropper can't frame. It segments the eye, keeps the mask that best overlaps the
+  reddish conjunctiva, and **falls back to the rule crop** when unsure. vit_b
+  weights (~375MB) download free (no API key) on first use; needs
+  `pip install segment-anything opencv-python` and internet ON.
+
+Eyeball it before committing to a run (saves a preview + prints timing, no
+training):
+
+```bash
+python src/sam_crop.py            # offline synthetic self-check
+python src/sam_crop.py --smoke    # 4 imgs/source -> results/sam_crop_preview.png
+```
