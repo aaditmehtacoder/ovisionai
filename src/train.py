@@ -18,10 +18,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
+import data  # noqa: E402  (ConjunctivaDataset/SOURCE_ORDER for the balanced loader)
 from data import genders_for_split, prepare_data  # noqa: E402
 from model import OVisionModel, build_loss, save_checkpoint  # noqa: E402
 from utils import (  # noqa: E402
@@ -30,6 +32,7 @@ from utils import (  # noqa: E402
     pretty_print_metrics,
     regression_metrics,
     save_json,
+    seed_worker,
     set_seed,
 )
 
@@ -42,9 +45,118 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=config.EPOCHS)
     p.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
     p.add_argument("--lr", type=float, default=config.LEARNING_RATE)
+    # Balanced-sampling A/B switches (default to config). Use e.g.
+    #   --no-balance-classes --no-balance-sources   for the unbalanced baseline.
+    p.add_argument("--balance-classes", action=argparse.BooleanOptionalAction,
+                   default=config.BALANCE_CLASSES,
+                   help="Balance anemic vs non-anemic per batch (default on).")
+    p.add_argument("--balance-sources", action=argparse.BooleanOptionalAction,
+                   default=config.BALANCE_SOURCES,
+                   help="Balance india/italy/ghana per batch (default on).")
     p.add_argument("--wandb", action="store_true",
                    help="Enable Weights & Biases logging (optional; off by default).")
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Balanced sampling — reshape ONLY what the train loader draws (val/test stay
+# as-is). Lives here (not data.py) so the shared data loader/crop are untouched;
+# crossval.py imports make_train_loader so both paths balance identically.
+# ---------------------------------------------------------------------------
+def _anemia_labels(df, indices):
+    """Per-sample anemic flag, derived from hgb + the gender-aware cutoff.
+    Computed directly (not read off df['anemic']) so unknown-gender rows still
+    get a class via anemia_cutoff's scalar fallback."""
+    return np.array(
+        [float(df.loc[i, "hgb"]) < config.anemia_cutoff(df.loc[i, "gender"])
+         for i in indices],
+        dtype=bool,
+    )
+
+
+def compute_sample_weights(df, indices):
+    """Sampling weight per train sample: inverse-frequency over a balancing KEY.
+
+    The key is the derived anemia class (BALANCE_CLASSES only), the source
+    (BALANCE_SOURCES only), or — when BOTH are on — the JOINT (source, class)
+    cell. Giving every cell equal total mass is what "class-balance within a
+    source-even draw" actually means: equal cells => 50/50 anemic AND even
+    sources at the same time. (Multiplying the two marginal inverse-frequencies
+    does NOT achieve this — a source skewed toward one class throws the global
+    class rate off.) Returns (weights, labels, sources)."""
+    n = len(indices)
+    weights = np.ones(n, dtype=np.float64)
+    labels = _anemia_labels(df, indices)
+    sources = np.array([df.loc[i, "source"] for i in indices], dtype=object)
+
+    if config.BALANCE_CLASSES and config.BALANCE_SOURCES:
+        key = np.array([f"{s}|{int(a)}" for s, a in zip(sources, labels)], dtype=object)
+    elif config.BALANCE_CLASSES:
+        key = labels.astype(int).astype(object)
+    elif config.BALANCE_SOURCES:
+        key = sources
+    else:
+        return weights, labels, sources
+
+    for grp in np.unique(key):
+        m = key == grp
+        c = int(m.sum())
+        if c:
+            weights[m] = 1.0 / c
+    return weights, labels, sources
+
+
+def _report_balance(weights, labels, sources, tag=""):
+    """Draw a stream from the SAME weights the sampler uses and print the
+    resulting anemic % and per-source % — proof it's actually balancing, with the
+    raw (unsampled) pool shown for contrast."""
+    n_stream = max(2000, 4 * len(weights))
+    gen = torch.Generator()
+    gen.manual_seed(config.SEED + 1)
+    drawn = np.array(list(WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=n_stream, replacement=True, generator=gen)))
+    d_lab, d_src = labels[drawn], sources[drawn]
+
+    def src_line(src_arr):
+        return "  ".join(
+            f"{s}={100.0 * float((src_arr == s).mean()):4.1f}%"
+            for s in data.SOURCE_ORDER if (sources == s).any())
+
+    head = f"[balance]{(' ' + tag) if tag else ''} "
+    print(f"{head}flags: classes={config.BALANCE_CLASSES} "
+          f"sources={config.BALANCE_SOURCES}  (stream of {n_stream} draws)")
+    print(f"{head}  raw pool : anemic={100.0 * labels.mean():4.1f}%   "
+          f"{src_line(sources)}")
+    print(f"{head}  sampled  : anemic={100.0 * d_lab.mean():4.1f}%   "
+          f"{src_line(d_src)}")
+
+
+def make_train_loader(df, indices, task, tag=""):
+    """Train DataLoader. With balancing off (both flags False) this is exactly
+    data.make_loader(train=True). With either flag on, swap the shuffle for a
+    WeightedRandomSampler over the same dataset (crop/loader logic unchanged)."""
+    if not (config.BALANCE_CLASSES or config.BALANCE_SOURCES):
+        return data.make_loader(df, indices, task, train=True)
+
+    weights, labels, sources = compute_sample_weights(df, indices)
+    _report_balance(weights, labels, sources, tag=tag)
+
+    generator = torch.Generator()
+    generator.manual_seed(config.SEED)
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(indices), replacement=True, generator=generator)
+    ds = data.ConjunctivaDataset(df, indices, task, train=True)
+    return DataLoader(
+        ds,
+        batch_size=config.BATCH_SIZE,
+        sampler=sampler,           # mutually exclusive with shuffle=True
+        num_workers=config.NUM_WORKERS,
+        worker_init_fn=seed_worker,
+        generator=generator,
+        drop_last=False,
+    )
 
 
 def run_epoch(model, loader, criterion, device, optimizer=None):
@@ -99,11 +211,16 @@ def main():
     # Allow CLI overrides of a few config values.
     config.BATCH_SIZE = args.batch_size
     config.BACKBONE = args.backbone
+    config.BALANCE_CLASSES = args.balance_classes
+    config.BALANCE_SOURCES = args.balance_sources
 
     df, task, splits, loaders = prepare_data(requested_task=args.task, verbose=True)
     print(f"[train] resolved task = {task}")
     print(f"[train] split sizes -> "
           f"train:{len(splits['train'])} val:{len(splits['val'])} test:{len(splits['test'])}")
+
+    # Swap the train loader for the balanced one (val/test stay exactly as built).
+    loaders["train"] = make_train_loader(df, splits["train"], task, tag="train")
 
     model = OVisionModel(task=task, backbone=args.backbone).to(device)
     criterion = build_loss(task)

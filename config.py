@@ -224,6 +224,26 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 2
 
+# ---------------------------------------------------------------------------
+# 5b. Balanced sampling  (fight base-rate cheating without touching the data)
+# ---------------------------------------------------------------------------
+# The pooled set is ~72% anemic and ~78% Ghana, so a lazy model wins by always
+# guessing "anemic" and by overfitting Ghana (high sensitivity, low specificity).
+# These two flags reshape ONLY what the TRAIN loader draws (val/test untouched)
+# via a WeightedRandomSampler — the task stays regression on raw Hgb.
+#
+#   BALANCE_CLASSES  -> weight so anemic vs non-anemic land ~50/50 per batch.
+#                       The class is DERIVED from hgb + the gender-aware cutoff
+#                       (anemia_cutoff); it only shapes sampling, never the target.
+#   BALANCE_SOURCES  -> weight so india / italy / ghana are drawn more evenly
+#                       instead of ~78% Ghana.
+# When both are on, weighting is inverse-frequency over the JOINT (source, class)
+# cell — equal cells give 50/50 anemic AND even sources at once (class-balance
+# within a source-even draw). Flip either off to A/B against the unbalanced
+# baseline; with both off the train loader is the old shuffled make_loader.
+BALANCE_CLASSES = True
+BALANCE_SOURCES = True
+
 # Frozen split ratios. The split is PATIENT-level (all of a patient's images
 # stay on the same side), computed once, saved to SPLIT_PATH, and reused on
 # every later run so results are comparable.

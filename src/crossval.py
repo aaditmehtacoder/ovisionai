@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 import data  # noqa: E402
 from model import OVisionModel, build_loss  # noqa: E402
-from train import run_epoch  # noqa: E402  (reuse the exact train/eval loop)
+from train import make_train_loader, run_epoch  # noqa: E402  (reuse train loop + balanced loader)
 from utils import get_device, regression_metrics, set_seed  # noqa: E402
 
 
@@ -49,6 +49,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=config.LEARNING_RATE)
     p.add_argument("--datasets", default=None,
                    help="comma list overriding config.DATASETS, e.g. 'eyes_defy'")
+    # Same balanced-sampling A/B switches as train.py (default to config). Run
+    # once with both on and once with --no-balance-classes --no-balance-sources
+    # to compare the per-source table directly.
+    p.add_argument("--balance-classes", action=argparse.BooleanOptionalAction,
+                   default=config.BALANCE_CLASSES,
+                   help="Balance anemic vs non-anemic per batch (default on).")
+    p.add_argument("--balance-sources", action=argparse.BooleanOptionalAction,
+                   default=config.BALANCE_SOURCES,
+                   help="Balance india/italy/ghana per batch (default on).")
     return p.parse_args()
 
 
@@ -83,11 +92,14 @@ def main():
         config.DATASETS = tuple(s.strip() for s in args.datasets.split(",") if s.strip())
     config.BATCH_SIZE = args.batch_size
     config.BACKBONE = args.backbone
+    config.BALANCE_CLASSES = args.balance_classes
+    config.BALANCE_SOURCES = args.balance_sources
 
     set_seed(config.SEED)
     device = get_device()
     print(f"[crossval] device={device}  datasets={config.DATASETS}  "
-          f"folds={args.folds}  epochs={args.epochs}  backbone={args.backbone}")
+          f"folds={args.folds}  epochs={args.epochs}  backbone={args.backbone}  "
+          f"balance(classes={config.BALANCE_CLASSES}, sources={config.BALANCE_SOURCES})")
 
     df = data.build_dataframe(verbose=True)
     task = data.resolve_task(df, "regression")
@@ -105,7 +117,7 @@ def main():
             print(f"[crossval] fold {f}: empty train/test — skipping.")
             continue
 
-        train_loader = data.make_loader(df, train_idx, task, train=True)
+        train_loader = make_train_loader(df, train_idx, task, tag=f"fold{f}")
         test_loader = data.make_loader(df, test_idx, task, train=False, shuffle=False)
 
         model = OVisionModel(task=task, backbone=args.backbone).to(device)
