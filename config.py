@@ -151,10 +151,16 @@ def anemia_cutoff(gender) -> float:
 # ---------------------------------------------------------------------------
 # 4. Model
 # ---------------------------------------------------------------------------
-# "resnet18" or "efficientnet_b0" (both pretrained on ImageNet via torchvision).
+# Supported backbones (all pretrained on ImageNet via torchvision), light -> heavy:
+#   "resnet18" | "resnet50" | "efficientnet_b0" | "efficientnet_b3"
+# Swapped for the same single-output regression head in model.py.
 BACKBONE = "resnet18"
 PRETRAINED = True
 IMAGE_SIZE = 224  # square resize fed to the backbone
+
+# Backbones the sweep (src/backbone_sweep.py) trains in sequence, backbone as the
+# ONLY variable. resnet18 is excluded here because it's the baseline reference.
+SWEEP_BACKBONES = ("resnet50", "efficientnet_b0", "efficientnet_b3")
 
 # ImageNet normalization (matches the pretrained backbones).
 NORM_MEAN = (0.485, 0.456, 0.406)

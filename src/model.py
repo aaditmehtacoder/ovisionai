@@ -1,8 +1,8 @@
 """
 model.py — a simple transfer-learning baseline with a switchable head.
 
-One backbone (ResNet18 or EfficientNet-B0, pretrained on ImageNet) feeding a
-single-logit head used for BOTH tasks:
+One backbone (resnet18 / resnet50 / efficientnet_b0 / efficientnet_b3, pretrained
+on ImageNet) feeding a single-logit head used for BOTH tasks:
   * classification: the logit is passed through sigmoid -> P(anemic).
   * regression:     the logit IS the predicted Hb (g/dL), no activation.
 
@@ -51,8 +51,13 @@ class OVisionModel(nn.Module):
 
 
 def _make_backbone(name: str, pretrained: bool):
-    """Return (feature_extractor, num_features) with the classifier stripped."""
-    name = name.lower()
+    """Return (feature_extractor, num_features) with the classifier stripped.
+
+    Supports resnet18 / resnet50 / efficientnet_b0 / efficientnet_b3. Each loads
+    torchvision ImageNet weights (when pretrained), strips the final classifier
+    to nn.Identity to expose pooled features, and reports its feature width so the
+    shared single-output head in OVisionModel attaches unchanged for every one."""
+    name = _canon_backbone(name)
     if name == "resnet18":
         weights = models.ResNet18_Weights.DEFAULT if pretrained else None
         net = models.resnet18(weights=weights)
@@ -60,16 +65,49 @@ def _make_backbone(name: str, pretrained: bool):
         net.fc = nn.Identity()  # expose pooled features
         return net, in_features
 
-    if name in ("efficientnet_b0", "efficientnet-b0", "efficientnetb0"):
+    if name == "resnet50":
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+        net = models.resnet50(weights=weights)
+        in_features = net.fc.in_features
+        net.fc = nn.Identity()
+        return net, in_features
+
+    if name == "efficientnet_b0":
         weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
         net = models.efficientnet_b0(weights=weights)
         in_features = net.classifier[1].in_features
         net.classifier = nn.Identity()
         return net, in_features
 
+    if name == "efficientnet_b3":
+        weights = models.EfficientNet_B3_Weights.DEFAULT if pretrained else None
+        net = models.efficientnet_b3(weights=weights)
+        in_features = net.classifier[1].in_features
+        net.classifier = nn.Identity()
+        return net, in_features
+
     raise ValueError(
-        f"Unknown backbone '{name}'. Use 'resnet18' or 'efficientnet_b0'."
+        f"Unknown backbone '{name}'. Use one of: {', '.join(SUPPORTED_BACKBONES)}."
     )
+
+
+# Canonical backbone names the sweep + config agree on.
+SUPPORTED_BACKBONES = ("resnet18", "resnet50", "efficientnet_b0", "efficientnet_b3")
+
+
+def _canon_backbone(name: str) -> str:
+    """Normalize aliases (hyphens, no-underscore) to a canonical SUPPORTED name."""
+    key = name.lower().replace("-", "_").replace(" ", "_")
+    if key.startswith("efficientnet") and "_" not in key[len("efficientnet"):]:
+        key = "efficientnet_" + key[len("efficientnet"):]
+    return key
+
+
+def count_parameters(model: nn.Module):
+    """(total, trainable) parameter counts for a built model."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
 def build_loss(task: str):

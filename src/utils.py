@@ -48,6 +48,35 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def is_cuda_oom(err: Exception) -> bool:
+    """True if `err` is a CUDA out-of-memory error (message-sniffed, since torch
+    raises a plain RuntimeError for it)."""
+    return isinstance(err, RuntimeError) and "out of memory" in str(err).lower()
+
+
+def run_with_oom_retry(fn, set_batch_size, get_batch_size, min_batch: int = 1):
+    """Call `fn()`; on CUDA OOM, halve the batch size and retry until it fits.
+
+    Heavier backbones (e.g. EfficientNet-B3) may not fit at the default batch
+    size. `get_batch_size`/`set_batch_size` read and write the live batch-size
+    knob (config.BATCH_SIZE) so the retried `fn` rebuilds its loaders smaller.
+    Returns whatever `fn` returns. Re-raises any non-OOM error, or OOM once the
+    batch size can't shrink further."""
+    while True:
+        try:
+            return fn()
+        except RuntimeError as err:
+            bs = get_batch_size()
+            if is_cuda_oom(err) and bs > min_batch:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                new_bs = max(min_batch, bs // 2)
+                set_batch_size(new_bs)
+                print(f"[oom] CUDA OOM at batch_size={bs} -> retrying at {new_bs}")
+                continue
+            raise
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
